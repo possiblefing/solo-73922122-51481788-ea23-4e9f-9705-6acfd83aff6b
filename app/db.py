@@ -62,11 +62,33 @@ CREATE INDEX IF NOT EXISTS idx_login_inflight_account
     ON login_inflight(account_id);
 
 CREATE TABLE IF NOT EXISTS sessions (
-    token      TEXT PRIMARY KEY,
-    account_id INTEGER NOT NULL REFERENCES accounts(id),
-    created_at REAL NOT NULL,
-    expires_at REAL NOT NULL
+    token       TEXT PRIMARY KEY,
+    account_id  INTEGER NOT NULL REFERENCES accounts(id),
+    created_at  REAL NOT NULL,
+    expires_at  REAL NOT NULL,
+    -- P-256 uncompressed point (hex) bound at login; proof-of-possession
+    -- checks sign challenges with the matching non-extractable private key.
+    public_key  TEXT NOT NULL,
+    -- 1 = key-bound session created by the current schema; 0 would only
+    -- appear on legacy rows produced by an older deployment, which must be
+    -- rejected (they have no key to prove possession with).
+    bound       INTEGER NOT NULL DEFAULT 1
 );
+
+CREATE TABLE IF NOT EXISTS auth_challenges (
+    id            TEXT PRIMARY KEY,
+    session_token TEXT NOT NULL,
+    purpose       TEXT NOT NULL,
+    method        TEXT NOT NULL,
+    path          TEXT NOT NULL,
+    created_at    REAL NOT NULL,
+    expires_at    REAL NOT NULL,
+    consumed_at   REAL
+);
+CREATE INDEX IF NOT EXISTS idx_auth_challenges_session
+    ON auth_challenges(session_token);
+CREATE INDEX IF NOT EXISTS idx_auth_challenges_expiry
+    ON auth_challenges(expires_at);
 """
 
 
@@ -105,17 +127,46 @@ def immediate_tx(conn: sqlite3.Connection) -> Iterator[sqlite3.Connection]:
         raise
 
 
+def _migrate_legacy_schema(conn: sqlite3.Connection) -> None:
+    """Upgrade a database created by an older version of the service.
+
+    Sessions issued before key binding have no public key. They are kept on
+    disk (so the rolling-window accounts remain untouched) but flagged
+    ``bound = 0``; every authenticated endpoint rejects such rows, i.e.
+    "old unbound sessions refuse to authenticate". A fresh login replaces
+    them with a key-bound session.
+    """
+    cols = {r["name"] for r in conn.execute("PRAGMA table_info(sessions)")}
+    if "public_key" not in cols:
+        conn.execute(
+            "ALTER TABLE sessions ADD COLUMN public_key TEXT"
+        )
+    if "bound" not in cols:
+        conn.execute(
+            "ALTER TABLE sessions ADD COLUMN bound INTEGER NOT NULL DEFAULT 0"
+        )
+    # Any historical row necessarily lacks a key; mark it unbound explicitly.
+    conn.execute(
+        "UPDATE sessions SET bound = 0"
+        " WHERE public_key IS NULL OR length(public_key) = 0"
+    )
+
+
 def init_db() -> None:
-    """Create the schema, seed demo accounts and clear stale in-flight slots.
+    """Create the schema, seed demo accounts and clear stale state.
 
     Safe to run concurrently from several processes: DDL uses
     ``IF NOT EXISTS`` and account seeding uses ``INSERT OR IGNORE``.
+    Challenges and sessions are *durable* across restarts (the spec requires
+    surviving sessions/challenges to keep working), so neither table is
+    truncated here; only expired challenge rows are pruned lazily.
     """
     conn = connect()
     try:
         conn.executescript(SCHEMA)
         now = time.time()
         with immediate_tx(conn):
+            _migrate_legacy_schema(conn)
             for username, password in SEED_ACCOUNTS:
                 row = conn.execute(
                     "SELECT id FROM accounts WHERE username = ?", (username,)
@@ -133,6 +184,11 @@ def init_db() -> None:
             # dead: reclaim all slots. Completed errors are intentionally
             # kept so the rolling window survives the restart.
             conn.execute("DELETE FROM login_inflight")
+            # Expired challenges can never be used again; drop them. Valid
+            # challenges (and all sessions) intentionally survive the restart.
+            conn.execute(
+                "DELETE FROM auth_challenges WHERE expires_at <= ?", (now,)
+            )
     finally:
         conn.close()
 
@@ -188,6 +244,7 @@ def settle(
     now: Optional[float] = None,
     session_token: Optional[str] = None,
     session_expires_at: Optional[float] = None,
+    session_public_key: Optional[str] = None,
 ) -> bool:
     """Book a finished verification and, on success, issue the session.
 
@@ -225,11 +282,17 @@ def settle(
                 )
                 if session_token is None or session_expires_at is None:
                     raise RuntimeError("successful settlement requires a session")
+                if not session_public_key:
+                    raise RuntimeError(
+                        "successful settlement requires a bound public key"
+                    )
                 conn.execute(
                     "INSERT INTO sessions"
-                    " (token, account_id, created_at, expires_at)"
-                    " VALUES (?, ?, ?, ?)",
-                    (session_token, account_id, now, session_expires_at),
+                    " (token, account_id, created_at, expires_at,"
+                    "  public_key, bound)"
+                    " VALUES (?, ?, ?, ?, ?, 1)",
+                    (session_token, account_id, now, session_expires_at,
+                     session_public_key),
                 )
             else:
                 # Error is counted at *completion* time, not acquisition time.
@@ -244,13 +307,20 @@ def settle(
 
 
 def get_session(token: str, now: Optional[float] = None) -> Optional[sqlite3.Row]:
+    """Return a live, **key-bound** session row, or ``None``.
+
+    Legacy rows created before key binding carry ``bound = 0`` and are never
+    returned: holding their cookie alone cannot authenticate because there is
+    no key to prove possession with.
+    """
     now = time.time() if now is None else now
     conn = connect()
     try:
         return conn.execute(
-            "SELECT s.token, s.expires_at, a.id AS account_id, a.username"
+            "SELECT s.token, s.expires_at, s.public_key,"
+            " a.id AS account_id, a.username"
             " FROM sessions s JOIN accounts a ON a.id = s.account_id"
-            " WHERE s.token = ? AND s.expires_at > ?",
+            " WHERE s.token = ? AND s.expires_at > ? AND s.bound = 1",
             (token, now),
         ).fetchone()
     finally:
@@ -262,6 +332,165 @@ def delete_session(token: str) -> None:
     try:
         with immediate_tx(conn):
             conn.execute("DELETE FROM sessions WHERE token = ?", (token,))
+            # A dead session can never answer a challenge again.
+            conn.execute(
+                "DELETE FROM auth_challenges WHERE session_token = ?", (token,)
+            )
+    finally:
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Proof-of-possession challenges
+# ---------------------------------------------------------------------------
+
+def create_challenge(
+    session_token: str,
+    purpose: str,
+    method: str,
+    path: str,
+    ttl_seconds: int,
+    now: Optional[float] = None,
+) -> dict:
+    """Mint a random, session- and purpose-bound challenge.
+
+    Multiple tabs each get their own row: issuing never overwrites another
+    outstanding challenge, so parallel tabs never invalidate each other.
+    Expired rows of this session are pruned opportunistically.
+    """
+    now = time.time() if now is None else now
+    challenge_id = uuid.uuid4().hex + uuid.uuid4().hex  # 256 bits
+    expires_at = now + ttl_seconds
+    conn = connect()
+    try:
+        with immediate_tx(conn):
+            conn.execute(
+                "DELETE FROM auth_challenges"
+                " WHERE session_token = ? AND expires_at <= ?",
+                (session_token, now),
+            )
+            conn.execute(
+                "INSERT INTO auth_challenges"
+                " (id, session_token, purpose, method, path,"
+                "  created_at, expires_at, consumed_at)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, NULL)",
+                (challenge_id, session_token, purpose,
+                 method.upper(), path, now, expires_at),
+            )
+    finally:
+        conn.close()
+    return {
+        "challenge": challenge_id,
+        "purpose": purpose,
+        "method": method.upper(),
+        "path": path,
+        "expires_at": expires_at,
+        "ttl_seconds": ttl_seconds,
+    }
+
+
+def get_challenge(challenge_id: str, now: Optional[float] = None) -> Optional[sqlite3.Row]:
+    """Read-only lookup used *before* signature verification.
+
+    No write lock is taken here (and none is held while the ECDSA check
+    runs). The row is re-validated atomically inside :func:`consume_challenge`
+    at submission time.
+    """
+    now = time.time() if now is None else now
+    conn = connect()
+    try:
+        return conn.execute(
+            "SELECT id, session_token, purpose, method, path,"
+            " created_at, expires_at, consumed_at"
+            " FROM auth_challenges WHERE id = ?",
+            (challenge_id,),
+        ).fetchone()
+    finally:
+        conn.close()
+
+
+def consume_challenge(
+    challenge_id: str,
+    session_token: str,
+    purpose: str,
+    method: str,
+    path: str,
+    revoke_session: bool,
+    now: Optional[float] = None,
+) -> Optional[sqlite3.Row]:
+    """Atomically validate-and-consume one challenge, optionally revoking.
+
+    The whole check runs in a single ``BEGIN IMMEDIATE`` transaction, which is
+    the cross-process serialization point: two concurrent submissions of the
+    same challenge race for the WAL write lock; the first consumes the row,
+    the second finds ``consumed_at`` already set and fails.
+
+    A challenge is consumed only when *everything* matches (session still
+    live and bound, purpose/method/path equal, not expired, not consumed).
+    Signature failures never reach this function, so a failed signature never
+    consumes a challenge. When ``revoke_session`` is set, the session row is
+    deleted in the same transaction -- challenge consumption and logout
+    commit together or not at all, and no late verification can restore the
+    session afterwards.
+
+    Returns the authorized session row on success, otherwise ``None``.
+    """
+    now = time.time() if now is None else now
+    conn = connect()
+    try:
+        with immediate_tx(conn):
+            row = conn.execute(
+                "SELECT id, session_token, purpose, method, path,"
+                " expires_at, consumed_at"
+                " FROM auth_challenges WHERE id = ?",
+                (challenge_id,),
+            ).fetchone()
+            if row is None:
+                conn.execute("ROLLBACK")
+                return None
+            if (
+                row["consumed_at"] is not None
+                or row["expires_at"] <= now
+                or row["session_token"] != session_token
+                or row["purpose"] != purpose
+                or row["method"] != method.upper()
+                or row["path"] != path
+            ):
+                conn.execute("ROLLBACK")
+                return None
+            # Re-check that the session is still live AND key-bound at
+            # submission time: it may have been revoked between challenge
+            # issuance and this request.
+            session = conn.execute(
+                "SELECT s.token, s.expires_at, s.public_key,"
+                " a.id AS account_id, a.username"
+                " FROM sessions s JOIN accounts a ON a.id = s.account_id"
+                " WHERE s.token = ? AND s.expires_at > ? AND s.bound = 1",
+                (session_token, now),
+            ).fetchone()
+            if session is None:
+                conn.execute("ROLLBACK")
+                return None
+            cur = conn.execute(
+                "UPDATE auth_challenges SET consumed_at = ?"
+                " WHERE id = ? AND consumed_at IS NULL",
+                (now, challenge_id),
+            )
+            if cur.rowcount != 1:
+                # Lost the concurrent-consume race (or a duplicate row id,
+                # which cannot happen with 256 random bits).
+                conn.execute("ROLLBACK")
+                return None
+            if revoke_session:
+                conn.execute(
+                    "DELETE FROM sessions WHERE token = ?", (session_token,)
+                )
+                # Outstanding challenges of the revoked session die with it.
+                conn.execute(
+                    "DELETE FROM auth_challenges WHERE session_token = ?",
+                    (session_token,),
+                )
+            return session
     finally:
         conn.close()
 

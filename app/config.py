@@ -27,6 +27,8 @@ class Settings:
     # Largest simulated verification delay the client may request, in seconds.
     max_delay_seconds: int = _env_int("MAX_DELAY_SECONDS", 10)
     session_ttl_seconds: int = _env_int("SESSION_TTL_SECONDS", 3600)
+    # Proof-of-possession challenge lifetime (seconds). The spec fixes 60s.
+    challenge_ttl_seconds: int = _env_int("CHALLENGE_TTL_SECONDS", 60)
     process_name: str = os.environ.get("PROCESS_NAME", "login")
 
 

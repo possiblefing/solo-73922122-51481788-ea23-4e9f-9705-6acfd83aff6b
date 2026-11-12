@@ -8,6 +8,8 @@ services:
       ERROR_WINDOW_SECONDS: "60"
       MAX_SLOTS: "5"
       MAX_DELAY_SECONDS: "10"
+      CHALLENGE_TTL_SECONDS: "60"
+      SESSION_TTL_SECONDS: "3600"
     volumes:
       - login-db:/data
     ports:
@@ -28,6 +30,8 @@ services:
       ERROR_WINDOW_SECONDS: "60"
       MAX_SLOTS: "5"
       MAX_DELAY_SECONDS: "10"
+      CHALLENGE_TTL_SECONDS: "60"
+      SESSION_TTL_SECONDS: "3600"
     volumes:
       - login-db:/data
     ports:

@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
-<title>并发密码猜测限制 · 登录演示</title>
+<title>持有证明登录 · P-256 挑战签名演示</title>
 <style>
   :root {
     --bg: #0f172a; --panel: #1e293b; --panel2: #273449; --line: #334155;
@@ -16,7 +16,7 @@
       "Microsoft YaHei", sans-serif;
     background: var(--bg); color: var(--text);
   }
-  .wrap { max-width: 1180px; margin: 0 auto; padding: 24px 20px 60px; }
+  .wrap { max-width: 1240px; margin: 0 auto; padding: 24px 20px 60px; }
   h1 { font-size: 22px; margin: 0 0 4px; }
   .sub { color: var(--muted); margin: 0 0 20px; font-size: 13px; }
   .grid { display: grid; gap: 16px; grid-template-columns: repeat(12, 1fr); }
@@ -29,15 +29,16 @@
   @media (max-width: 900px) {
     .span-4, .span-6, .span-8 { grid-column: span 12; }
   }
-  h2 { font-size: 15px; margin: 0 0 12px; display: flex; align-items: center; gap: 8px; }
+  h2 { font-size: 15px; margin: 0 0 12px; display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
   h2 .tag { font-weight: 400; font-size: 11px; color: var(--muted);
     border: 1px solid var(--line); border-radius: 999px; padding: 1px 8px; }
   label { display: block; font-size: 12px; color: var(--muted); margin: 10px 0 4px; }
-  input, select {
+  input, select, textarea {
     width: 100%; background: var(--panel2); color: var(--text);
-    border: 1px solid var(--line); border-radius: 8px; padding: 8px 10px; font-size: 14px;
+    border: 1px solid var(--line); border-radius: 8px; padding: 8px 10px; font-size: 13px;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
   }
-  input:focus, select:focus { outline: 1px solid var(--accent); border-color: var(--accent); }
+  input:focus, select:focus, textarea:focus { outline: 1px solid var(--accent); border-color: var(--accent); }
   .row2 { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
   .row3 { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 10px; }
   button {
@@ -61,9 +62,10 @@
   .muted { color: var(--muted); font-size: 12px; }
   code { background: var(--panel2); padding: 1px 6px; border-radius: 6px; font-size: 12px; }
   .result {
-    margin-top: 12px; border-radius: 8px; padding: 10px 12px; font-size: 13px;
+    margin-top: 12px; border-radius: 8px; padding: 10px 12px; font-size: 12.5px;
     background: var(--panel2); border: 1px solid var(--line); white-space: pre-wrap;
-    max-height: 220px; overflow: auto;
+    max-height: 260px; overflow: auto;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
   }
   .req-list { max-height: 340px; overflow: auto; margin-top: 8px; }
   .req-row { display: grid; grid-template-columns: 42px 90px 1fr 96px 110px; gap: 8px;
@@ -79,46 +81,56 @@
   .creds code { cursor: pointer; }
   .dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; margin-right: 6px; }
   .dot.live { background: var(--ok); } .dot.stale { background: var(--err); }
+  .keypair { font-family: ui-monospace, Menlo, monospace; font-size: 11.5px; word-break: break-all;
+    background: var(--panel2); border: 1px solid var(--line); border-radius: 8px; padding: 8px; }
+  textarea { resize: vertical; min-height: 64px; }
 </style>
 </head>
 <body>
 <div class="wrap">
-  <h1>并发密码猜测限制 · 登录演示</h1>
+  <h1>持有证明（Proof-of-Possession）登录 · P-256 挑战签名</h1>
   <p class="sub">
-    每账号 60 秒窗口内「已完成错误 + 在途核验」合计上限 5；核验前原子占位，满额立即 429 且不做哈希。
-    两个 Web 进程共享同一 SQLite（WAL），argon2 核验不持写锁、无全局串行锁；客户端断连后核验与结算仍会完成。
+    浏览器用 Web Crypto 生成 <b>不可导出</b> 的 ECDSA P-256 私钥并存入 IndexedDB（同源标签页共用）；登录时提交公钥并绑定新会话。
+    <code>/api/me</code>、<code>/api/logout</code> 必须先领取 60 秒随机挑战，再提交覆盖「挑战 + HTTP 方法 + 路径」的 ECDSA-SHA256 签名。
+    只复制 Cookie、重放签名都会被拒；同一挑战并发重放仅一次成功。原有的密码猜测限额、并行核验与断连结算保持不变。
   </p>
 
   <div class="grid">
+    <!-- 密钥状态 -->
+    <section class="card span-4">
+      <h2>浏览器密钥对 <span class="tag">IndexedDB · extractable=false</span></h2>
+      <div id="keybox"><span class="muted">初始化中…</span></div>
+      <div class="btn-row">
+        <button class="btn-ghost" id="btn-new-key">重新生成密钥</button>
+      </div>
+    </section>
+
     <!-- 当前身份 -->
     <section class="card span-4">
-      <h2>当前身份 <span class="tag">HttpOnly Cookie</span></h2>
+      <h2>当前身份 <span class="tag">Cookie + 签名</span></h2>
       <div id="identity"><span class="muted">加载中…</span></div>
       <div class="btn-row">
-        <button class="btn-ghost" id="btn-me">刷新身份</button>
-        <button class="btn-ghost" id="btn-logout">退出登录</button>
+        <button class="btn-ghost" id="btn-me">刷新身份（签名）</button>
+        <button class="btn-danger" id="btn-logout">退出登录（签名）</button>
       </div>
     </section>
 
     <!-- 名额状态 -->
-    <section class="card span-8">
+    <section class="card span-4">
       <h2>各账号剩余名额
         <span class="tag" id="poll-state"><span class="dot live"></span>1s 自动刷新</span>
       </h2>
       <table>
         <thead><tr>
-          <th>账号</th><th>窗口内错误</th><th>在途核验</th><th>已用 / 上限</th><th>剩余名额</th>
+          <th>账号</th><th>错误</th><th>在途</th><th>剩余</th>
         </tr></thead>
-        <tbody id="stats-body"><tr><td colspan="5" class="muted">加载中…</td></tr></tbody>
+        <tbody id="stats-body"><tr><td colspan="4" class="muted">加载中…</td></tr></tbody>
       </table>
-      <p class="muted" style="margin-bottom:0">
-        窗口时长 <b id="window-label">60</b> 秒，错误按「核验完成时刻」计数；服务重启保留窗口内错误、清空在途占位。
-      </p>
     </section>
 
     <!-- 单次登录 -->
     <section class="card span-6">
-      <h2>单次登录</h2>
+      <h2>密码登录（绑定公钥）</h2>
       <p class="muted" style="margin-top:0">预置账号（点击可填充）：</p>
       <div class="creds">
         <code data-u="alice" data-p="alice-pass-2026">alice / alice-pass-2026</code>
@@ -128,7 +140,7 @@
       <input id="login-user" value="alice" autocomplete="username" />
       <label>密码</label>
       <input id="login-pass" type="password" value="alice-pass-2026" autocomplete="current-password" />
-      <label>核验延迟（秒，用于演示交错完成，最大 <span id="max-delay">10</span>s）</label>
+      <label>核验延迟（秒，演示交错完成，最大 <span id="max-delay">10</span>s）</label>
       <input id="login-delay" type="number" min="0" max="10" step="0.5" value="0" />
       <div class="btn-row">
         <button class="btn-primary" id="btn-login">发起登录</button>
@@ -138,7 +150,7 @@
 
     <!-- 并发风暴 -->
     <section class="card span-6">
-      <h2>并发请求 / 中途断开 <span class="tag">AbortController</span></h2>
+      <h2>密码限额 / 中途断开 <span class="tag">原能力保留</span></h2>
       <div class="row3">
         <div>
           <label>账号</label>
@@ -165,17 +177,56 @@
       </div>
     </section>
 
+    <!-- 演示 1：复制 Cookie -->
+    <section class="card span-6">
+      <h2>演示 A：复制 Cookie 到另一浏览器 <span class="tag">无密钥 → 拒绝</span></h2>
+      <p class="muted" style="margin-top:0">
+        先登录，然后点按钮经签名接口取回当前 Cookie 值（HttpOnly，JS 读不到，故由服务端在签名校验后返回），
+        把它粘贴到下方「无密钥客户端」——该上下文故意不持有 IndexedDB 私钥，模拟只偷到 Cookie 的攻击者。
+      </p>
+      <div class="btn-row" style="margin-top:6px">
+        <button class="btn-primary" id="btn-copy-cookie">1. 签名取回我的 Cookie</button>
+        <button class="btn-ghost" id="btn-attacker-get">2. 无密钥 GET /api/me</button>
+        <button class="btn-ghost" id="btn-attacker-chal">3. 无密钥领挑战/尝试注销</button>
+      </div>
+      <label>攻击者持有的 Cookie（可编辑后再试）</label>
+      <textarea id="attacker-cookie" placeholder="session=..."></textarea>
+      <div class="result" id="attacker-result" hidden></div>
+    </section>
+
+    <!-- 演示 2：并发重放 -->
+    <section class="card span-6">
+      <h2>演示 B：同挑战并发重放 <span class="tag">仅一次成功</span></h2>
+      <p class="muted" style="margin-top:0">
+        先登录。点按钮领取 <b>一个</b> 挑战并生成 <b>一份</b> 有效签名，然后把同一个（挑战, 签名）对
+        同时并发提交 N 次到 <code>/api/me</code>：服务端原子消费，预期恰好 1 个 200，其余全部 401。
+      </p>
+      <div class="row2">
+        <div>
+          <label>并发份数</label>
+          <input id="replay-count" type="number" min="2" max="20" value="8" />
+        </div>
+        <div style="display:flex;align-items:flex-end">
+          <div class="btn-row" style="margin:0">
+            <button class="btn-primary" id="btn-replay">并发重放同一签名</button>
+          </div>
+        </div>
+      </div>
+      <div class="result" id="replay-result" hidden></div>
+    </section>
+
     <!-- 演示说明 -->
     <section class="card span-12">
-      <h2>建议演示步骤</h2>
+      <h2>建议演示步骤与安全语义</h2>
       <div class="hint">
         <ol>
-          <li>对 <code>alice</code> 并发发起 <b>6</b> 个错误密码、延迟 4s：前 5 个原子占位进入在途，第 6 个立即收到 <b>429</b>（响应头 <code>Retry-After</code>），服务端不做 argon2 哈希。</li>
-          <li>在途期间点「全部断开」或单行「断开」：浏览器侧请求已取消，但右侧名额表仍显示 5 个在途；约 4s 后核验在服务端跑完并结算，在途归零、窗口错误变 5 —— 断连没有提前归还名额。</li>
-          <li>5 个错误结算后再发起任何请求（即使密码正确）都会立即 429；等待 60 秒窗口滑过，名额自动恢复。</li>
-          <li>在途未满时用正确密码发起一个长延迟请求，同时并发几个错误请求：成功完成会清除「当时已完成」的错误，而之后才完成的在途错误仍会计数。</li>
-          <li>多次发起观察 <code>X-Served-By</code> 响应头 / 结果中的处理进程，请求在 <b>web1 / web2</b> 两个进程间轮询，名额状态全局一致。</li>
-          <li>重启容器（<code>docker compose restart</code>）：窗口内错误仍在，未完成占位被清空。</li>
+          <li>页面加载即生成不可导出 P-256 私钥（IndexedDB）；刷新、新开同源标签页共用同一密钥。点「重新生成密钥」后旧会话签名将失效，需重新登录绑定新公钥。</li>
+          <li>用 <code>alice</code> 登录：请求体带公钥，成功后会话行绑定该公钥。点「刷新身份」可观察两次请求：先 <code>POST /api/challenge</code> 领 60 秒挑战，再 <code>GET /api/me</code> 并在 <code>X-Auth-Challenge</code> / <code>X-Auth-Signature</code> 头里提交 ECDSA 签名。</li>
+          <li><b>演示 A</b>：取回 Cookie → 在无密钥客户端点 GET /api/me（仅 Cookie，401）；尝试领挑战后用空/伪造签名调用也 401。把 Cookie 粘到另一个浏览器的开发者工具里同样无法通过。</li>
+          <li><b>演示 B</b>：同一挑战+签名并发 8 份，结果恰有 1 个 200、7 个 401（挑战已消费）；两个 Web 进程共享 SQLite，原子事务保证跨进程也只成功一次。</li>
+          <li>多标签页各自领挑战互不覆盖；挑战绑定会话与用途（<code>me</code> 挑战不能用于 <code>logout</code>，反之亦然），签名覆盖方法与路径，跨端点重放被拒。</li>
+          <li>验签失败 <b>不消费</b> 挑战，60 秒内可用正确签名重试；挑战过期或会话注销后迟到的签名不再有效，注销不能被迟到验签恢复。</li>
+          <li>密码限额演示保持原样：6 并发错误密码第 6 个立即 429、断连后服务端仍结算；<code>docker compose restart</code> 后会话与未过期挑战保留，旧版未绑定公钥的会话一律拒绝。</li>
         </ol>
       </div>
     </section>
@@ -188,7 +239,136 @@ const esc = (s) => String(s).replace(/[&<>"]/g, (c) =>
   ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
 const hhmmss = (t) => new Date(t * 1000).toLocaleTimeString("zh-CN", { hour12: false }) +
   "." + String(new Date(t * 1000).getMilliseconds()).padStart(3, "0");
+const b64url = (buf) => btoa(String.fromCharCode(...new Uint8Array(buf)))
+  .replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
 
+/* ---------------- IndexedDB 密钥存储 ---------------- */
+const DB_NAME = "pop-login-db", STORE = "keys", KEY_ID = "p256-main";
+
+function idb() {
+  return new Promise((resolve, reject) => {
+    const req = indexedDB.open(DB_NAME, 1);
+    req.onupgradeneeded = () => req.result.createObjectStore(STORE);
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error);
+  });
+}
+async function idbPut(cryptoKey) {
+  const d = await idb();
+  return new Promise((res, rej) => {
+    const tx = d.transaction(STORE, "readwrite");
+    tx.objectStore(STORE).put(cryptoKey, KEY_ID);
+    tx.oncomplete = res; tx.onerror = () => rej(tx.error);
+  });
+}
+async function idbGet() {
+  const d = await idb();
+  return new Promise((res, rej) => {
+    const tx = d.transaction(STORE, "readonly");
+    const r = tx.objectStore(STORE).get(KEY_ID);
+    r.onsuccess = () => res(r.result || null); r.onerror = () => rej(r.error);
+  });
+}
+async function idbClear() {
+  const d = await idb();
+  return new Promise((res, rej) => {
+    const tx = d.transaction(STORE, "readwrite");
+    tx.objectStore(STORE).delete(KEY_ID);
+    tx.oncomplete = res; tx.onerror = () => rej(tx.error);
+  });
+}
+
+/* ---------------- P-256 密钥与签名 ---------------- */
+let privateKey = null;
+let publicKeyB64 = null;
+
+async function generateKey() {
+  const kp = await crypto.subtle.generateKey(
+    { name: "ECDSA", namedCurve: "P-256" },
+    /*extractable=*/ false,
+    ["sign", "verify"]
+  );
+  const rawPub = await crypto.subtle.exportKey("raw", kp.publicKey);
+  // Store the non-extractable private handle together with the public point.
+  // The private bytes can never be read back; keeping the raw public key
+  // alongside avoids having to export public material from a non-extractable
+  // key on later page loads.
+  await idbPut({ privateKey: kp.privateKey, rawPublicKey: rawPub });
+  privateKey = kp.privateKey;
+  publicKeyB64 = b64url(rawPub);
+  return { privateKey: kp.privateKey, publicKeyB64 };
+}
+async function ensureKey() {
+  if (privateKey && publicKeyB64) return;
+  const stored = await idbGet();
+  if (stored && stored.privateKey) {
+    privateKey = stored.privateKey;
+    publicKeyB64 = b64url(stored.rawPublicKey);
+  } else {
+    await generateKey();
+  }
+}
+function signingMessage(challenge, method, path) {
+  // 与服务端 build_signing_message 完全一致的长度前缀拼装
+  const enc = new TextEncoder();
+  const parts = [enc.encode(challenge), enc.encode(method.toUpperCase()), enc.encode(path)];
+  const chunks = [];
+  let total = 0;
+  for (const p of parts) {
+    const prefix = enc.encode(p.byteLength + ":");
+    const sep = enc.encode("|");
+    chunks.push(prefix, p, sep);
+    total += prefix.byteLength + p.byteLength + sep.byteLength;
+  }
+  const merged = new Uint8Array(total);
+  let off = 0;
+  for (const chunk of chunks) { merged.set(chunk, off); off += chunk.byteLength; }
+  return merged;
+}
+async function sign(challenge, method, path) {
+  await ensureKey();
+  const sig = await crypto.subtle.sign(
+    { name: "ECDSA", hash: "SHA-256" }, privateKey,
+    signingMessage(challenge, method, path)
+  );
+  return b64url(sig); // Web Crypto 输出原生 r||s 64 字节
+}
+async function fetchChallenge(purpose) {
+  const r = await fetch("/api/challenge", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ purpose }),
+  });
+  if (!r.ok) throw new Error(`领取挑战失败 HTTP ${r.status}: ${JSON.stringify(await r.json().catch(() => ({})))}`);
+  return r.json();
+}
+// 完整「领挑战 → 签名 → 提交」封装：签名经 X-Auth-* 请求头传输，
+// 因此受保护接口保持自然的 HTTP 方法（GET /api/me、POST /api/logout）。
+async function signedCall(path, purpose, method) {
+  const ch = await fetchChallenge(purpose);
+  const signature = await sign(ch.challenge, method, path);
+  const r = await fetch(path, {
+    method,
+    headers: {
+      "X-Auth-Challenge": ch.challenge,
+      "X-Auth-Signature": signature,
+    },
+  });
+  const body = await r.json().catch(() => null);
+  return { status: r.status, body, servedBy: r.headers.get("X-Served-By") || "?",
+           challenge: ch.challenge, signature };
+}
+
+function renderKey() {
+  $("keybox").innerHTML = publicKeyB64
+    ? `<span class="pill ok">P-256 私钥已就绪</span>
+       <div class="muted" style="margin:6px 0">公钥（raw, base64url，登录时提交并绑定会话）：</div>
+       <div class="keypair">${esc(publicKeyB64)}</div>
+       <div class="muted" style="margin-top:6px">私钥 <code>extractable=false</code>，仅 IndexedDB 内部句柄可用，无法被 JS 读出复制。</div>`
+    : `<span class="pill warn">无密钥</span>`;
+}
+
+/* ---------------- 通用请求 ---------------- */
 async function api(path, opts = {}) {
   const t0 = performance.now();
   const resp = await fetch(path, opts);
@@ -199,34 +379,44 @@ async function api(path, opts = {}) {
            retryAfter: resp.headers.get("Retry-After") };
 }
 
-/* ---------- 身份 ---------- */
+/* ---------------- 身份 ---------------- */
 async function loadMe() {
   const box = $("identity");
   try {
-    const r = await api("/api/me");
+    const r = await signedCall("/api/me", "me", "GET");
     if (r.status === 200) {
-      box.innerHTML = `<span class="pill ok">已登录</span>
+      box.innerHTML = `<span class="pill ok">已登录（签名通过）</span>
         <div style="margin-top:8px">账号：<b>${esc(r.body.username)}</b></div>
         <div class="muted">会话到期：${hhmmss(r.body.expires_at)} · 进程 ${esc(r.body.served_by)}</div>`;
     } else {
-      box.innerHTML = `<span class="pill warn">未登录</span><div class="muted" style="margin-top:8px">暂无有效会话</div>`;
+      box.innerHTML = `<span class="pill warn">未登录/被拒</span>
+        <div class="muted" style="margin-top:8px">HTTP ${r.status}：${esc(JSON.stringify(r.body))}</div>`;
     }
   } catch (e) {
-    box.innerHTML = `<span class="pill err">查询失败</span><div class="muted" style="margin-top:8px">${esc(e.message)}</div>`;
+    // 401 while fetching the challenge simply means no usable session yet.
+    box.innerHTML = `<span class="pill warn">未登录</span>
+      <div class="muted" style="margin-top:8px">暂无有效会话，请在下方登录。</div>`;
   }
 }
 $("btn-me").onclick = loadMe;
 $("btn-logout").onclick = async () => {
-  await fetch("/api/logout", { method: "POST" });
+  try {
+    await signedCall("/api/logout", "logout", "POST");
+  } catch (e) {
+    console.warn("logout failed", e);
+  }
   loadMe(); loadStats();
 };
+$("btn-new-key").onclick = async () => {
+  await generateKey(); renderKey();
+  $("identity").innerHTML = `<span class="pill warn">密钥已更换</span><div class="muted" style="margin-top:8px">旧会话不再匹配新公钥，请重新登录。</div>`;
+};
 
-/* ---------- 名额统计 ---------- */
+/* ---------------- 名额统计 ---------------- */
 async function loadStats() {
   try {
     const r = await fetch("/api/stats");
     const data = await r.json();
-    $("window-label").textContent = data.window_seconds;
     $("max-delay").textContent = 10;
     $("stats-body").innerHTML = data.accounts.map((a) => {
       const full = a.remaining_slots === 0;
@@ -234,9 +424,7 @@ async function loadStats() {
         <td><b>${esc(a.username)}</b></td>
         <td>${a.window_errors}</td>
         <td>${a.inflight}</td>
-        <td>${a.used_slots} / ${a.max_slots}
-          <div class="bar"><i style="width:${(a.used_slots / a.max_slots) * 100}%"></i></div></td>
-        <td><span class="pill ${full ? "err" : "ok"}">${a.remaining_slots} 个</span></td>
+        <td><span class="pill ${full ? "err" : "ok"}">${a.remaining_slots}</span></td>
       </tr>`;
     }).join("");
     $("poll-state").innerHTML = '<span class="dot live"></span>1s 自动刷新';
@@ -246,7 +434,7 @@ async function loadStats() {
 }
 setInterval(loadStats, 1000);
 
-/* ---------- 凭据快速填充 ---------- */
+/* ---------------- 凭据快速填充 ---------------- */
 document.querySelectorAll(".creds code").forEach((el) => {
   el.onclick = () => {
     $("login-user").value = el.dataset.u;
@@ -254,19 +442,20 @@ document.querySelectorAll(".creds code").forEach((el) => {
   };
 });
 
-/* ---------- 单次登录 ---------- */
+/* ---------------- 单次登录 ---------------- */
 $("btn-login").onclick = async () => {
   const btn = $("btn-login"); btn.disabled = true;
   const out = $("login-result"); out.hidden = false;
   out.textContent = "请求中…";
-  const tWall = Date.now();
   try {
+    await ensureKey();
     const r = await api("/api/login", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         username: $("login-user").value,
         password: $("login-pass").value,
+        public_key: publicKeyB64,
         delay: parseFloat($("login-delay").value || "0"),
       }),
     });
@@ -285,10 +474,9 @@ $("btn-login").onclick = async () => {
   }
 };
 
-/* ---------- 并发风暴 ---------- */
+/* ---------------- 并发风暴（原密码限额演示） ---------------- */
 const controllers = new Set();
 let reqSeq = 0;
-
 function rowHtml(seq) {
   return `<div class="req-row" id="req-${seq}">
     <span>${seq}</span>
@@ -306,14 +494,12 @@ function setRow(seq, patch) {
   if (patch.dur !== undefined) el.querySelector(".dur").textContent = patch.dur;
   if (patch.proc !== undefined) el.querySelector(".proc").textContent = patch.proc;
 }
-
 $("btn-burst").onclick = async () => {
   const n = Math.max(1, Math.min(20, parseInt($("burst-count").value, 10) || 1));
   const delay = parseFloat($("burst-delay").value || "0");
   const username = $("burst-user").value;
   const password = $("burst-pass").value;
   $("btn-burst").disabled = true; $("btn-abort-all").disabled = false;
-
   const jobs = [];
   for (let i = 0; i < n; i++) {
     const seq = ++reqSeq;
@@ -322,51 +508,38 @@ $("btn-burst").onclick = async () => {
     $("burst-list").insertAdjacentHTML("beforeend", rowHtml(seq));
     const startWall = Date.now() / 1000;
     setRow(seq, { timeline: `开始 ${hhmmss(startWall)} · 账号 ${esc(username)} · 延迟 ${delay}s` });
-
     jobs.push((async () => {
       const t0 = performance.now();
       try {
         const r = await api("/api/login", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ username, password, delay }),
+          body: JSON.stringify({
+            username, password, delay,
+            public_key: publicKeyB64 || "missing-key",
+          }),
           signal: ctrl.signal,
         });
         const ms = Math.round(performance.now() - t0);
         const endWall = Date.now() / 1000;
         if (r.status === 200) {
-          setRow(seq, {
-            state: '<span class="pill ok">200 成功</span>',
-            timeline: `${hhmmss(startWall)} → ${hhmmss(endWall)} 登录成功`,
-            dur: ms + "ms", proc: r.servedBy,
-          });
+          setRow(seq, { state: '<span class="pill ok">200 成功</span>',
+            timeline: `${hhmmss(startWall)} → ${hhmmss(endWall)} 登录成功`, dur: ms + "ms", proc: r.servedBy });
         } else if (r.status === 429) {
-          setRow(seq, {
-            state: '<span class="pill err">429 限流</span>',
-            timeline: `${hhmmss(startWall)} → ${hhmmss(endWall)} 满额拒绝（未做哈希）` +
-              (r.retryAfter ? ` · Retry-After ${r.retryAfter}s` : ""),
-            dur: ms + "ms", proc: r.servedBy,
-          });
+          setRow(seq, { state: '<span class="pill err">429 限流</span>',
+            timeline: `满额拒绝（未做哈希）` + (r.retryAfter ? ` · Retry-After ${r.retryAfter}s` : ""),
+            dur: ms + "ms", proc: r.servedBy });
         } else {
-          setRow(seq, {
-            state: '<span class="pill warn">401 错误</span>',
-            timeline: `${hhmmss(startWall)} → ${hhmmss(endWall)} 凭据错误，已计入窗口`,
-            dur: ms + "ms", proc: r.servedBy,
-          });
+          setRow(seq, { state: `<span class="pill warn">${r.status}</span>`,
+            timeline: esc(JSON.stringify(r.body).slice(0, 120)), dur: ms + "ms", proc: r.servedBy });
         }
       } catch (e) {
         const ms = Math.round(performance.now() - t0);
         if (ctrl.signal.aborted) {
-          setRow(seq, {
-            state: '<span class="pill violet">本地已断开</span>',
-            timeline: `开始 ${hhmmss(startWall)} · 浏览器已取消，服务端仍在核验并将结算，请看名额表`,
-            dur: ms + "ms", proc: "—",
-          });
+          setRow(seq, { state: '<span class="pill violet">本地已断开</span>',
+            timeline: `浏览器已取消，服务端仍在核验并将结算，请看名额表`, dur: ms + "ms", proc: "—" });
         } else {
-          setRow(seq, {
-            state: '<span class="pill err">异常</span>',
-            timeline: esc(e.message), dur: ms + "ms", proc: "—",
-          });
+          setRow(seq, { state: '<span class="pill err">异常</span>', timeline: esc(e.message), dur: ms + "ms", proc: "—" });
         }
       } finally {
         controllers.delete(ctrl);
@@ -379,7 +552,6 @@ $("btn-burst").onclick = async () => {
   if (controllers.size === 0) $("btn-abort-all").disabled = true;
   loadMe();
 };
-
 $("btn-abort-all").onclick = () => {
   controllers.forEach((c) => c.abort());
   controllers.clear();
@@ -390,8 +562,126 @@ $("btn-clear").onclick = () => {
     '<div class="req-row head"><span>#</span><span>状态</span><span>时间线 / 结果</span><span>耗时</span><span>处理进程</span></div>';
 };
 
-loadMe();
-loadStats();
+/* ---------------- 演示 A：复制 Cookie ---------------- */
+function showResult(id, text) { const el = $(id); el.hidden = false; el.textContent = text; }
+
+$("btn-copy-cookie").onclick = async () => {
+  try {
+    const r = await signedCall("/api/demo/session-token", "demo_token", "GET");
+    if (r.status !== 200) {
+      showResult("attacker-result", `取回 Cookie 失败 HTTP ${r.status}\n${JSON.stringify(r.body, null, 2)}`);
+      return;
+    }
+    $("attacker-cookie").value = `${r.body.cookie_name}=${r.body.cookie_value}`;
+    showResult("attacker-result",
+      `已通过签名校验取回 Cookie（用户 ${r.body.username}）：\n${r.body.cookie_name}=${r.body.cookie_value}\n\n` +
+      `下面的请求将只带这个 Cookie、不带任何私钥签名。`);
+  } catch (e) { showResult("attacker-result", "异常：" + e.message); }
+};
+
+// 模拟只有 Cookie 的攻击者：浏览器禁止 JS 手工设置 Cookie 请求头，也无法改写
+// HttpOnly Cookie，因此这里直接发起一个不带 X-Auth-* 头的 GET /api/me
+// （浏览器只会自动附带 Cookie），并同时给出可粘贴到另一台机器的完整 curl。
+$("btn-attacker-get").onclick = async () => {
+  const r = await fetch("/api/me"); // 浏览器自动只附加 Cookie，无签名体
+  const body = await r.json().catch(() => null);
+  const cookieVal = $("attacker-cookie").value || "(浏览器自动携带当前 HttpOnly Cookie)";
+  showResult("attacker-result",
+    `【无密钥攻击者】GET /api/me（仅 Cookie：${esc(cookieVal)}）\n` +
+    `→ HTTP ${r.status}\n${JSON.stringify(body, null, 2)}\n\n` +
+    `等价 curl（粘贴到任何没有私钥的机器）：\n` +
+    `curl -i '${location.origin}/api/me' -H 'Cookie: ${esc($("attacker-cookie").value || "session=<粘贴>")}'`);
+};
+$("btn-attacker-chal").onclick = async () => {
+  const lines = [];
+  // 1) 只带 Cookie 领挑战：如果 Cookie 有效会领到，但攻击者没有私钥签不出名
+  const rc = await fetch("/api/challenge", {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ purpose: "logout" }),
+  });
+  const cb = await rc.json().catch(() => null);
+  lines.push(`① POST /api/challenge {purpose:"logout"}（仅 Cookie）→ HTTP ${rc.status}`);
+  lines.push(JSON.stringify(cb, null, 2));
+  if (rc.status === 200) {
+    // 2) 没有私钥：提交一个伪造签名，必须被拒，且挑战不被消费
+    const fake = b64url(crypto.getRandomValues(new Uint8Array(64)).buffer);
+    const rr = await fetch("/api/logout", {
+      method: "POST",
+      headers: { "X-Auth-Challenge": cb.challenge, "X-Auth-Signature": fake },
+    });
+    const rb = await rr.json().catch(() => null);
+    lines.push(`② POST /api/logout 用随机伪造签名头 → HTTP ${rr.status}（预期 401，挑战未消费）`);
+    lines.push(JSON.stringify(rb, null, 2));
+    // 3) 再用同一挑战 + 伪造签名重试，仍应 401（证明失败不消费）
+    const rr2 = await fetch("/api/logout", {
+      method: "POST",
+      headers: { "X-Auth-Challenge": cb.challenge, "X-Auth-Signature": fake },
+    });
+    lines.push(`③ 同一挑战再次伪造提交 → HTTP ${rr2.status}（仍 401：验签失败不消费挑战）`);
+  }
+  lines.push("", `跨浏览器手工复现：`,
+    `curl -i '${location.origin}/api/challenge' -H 'Content-Type: application/json'`,
+    `  -H 'Cookie: ${esc($("attacker-cookie").value || "session=<粘贴>")}'`,
+    `  -d '{"purpose":"me"}'   # 能领到挑战，但没有 P-256 私钥就无法生成有效签名`,
+    `curl -i '${location.origin}/api/me'`,
+    `  -H 'Cookie: ${esc($("attacker-cookie").value || "session=<粘贴>")}'`,
+    `  -H 'X-Auth-Challenge: <挑战>' -H 'X-Auth-Signature: <有效签名>'  # 无密钥则签不出`);
+  showResult("attacker-result", lines.join("\n"));
+};
+
+/* ---------------- 演示 B：并发重放 ---------------- */
+$("btn-replay").onclick = async () => {
+  const out = $("replay-result"); out.hidden = false; out.textContent = "准备一个挑战与签名…";
+  const n = Math.max(2, Math.min(20, parseInt($("replay-count").value, 10) || 8));
+  try {
+    const ch = await fetchChallenge("me");
+    const signature = await sign(ch.challenge, "GET", "/api/me");
+    out.textContent = `挑战 ${ch.challenge.slice(0, 16)}… 已生成一份签名，并发提交 ${n} 份…`;
+    const t0 = performance.now();
+    const results = await Promise.all(Array.from({ length: n }, async (_, i) => {
+      const ts = performance.now();
+      const r = await fetch("/api/me", {
+        method: "GET",
+        headers: {
+          "X-Auth-Challenge": ch.challenge,
+          "X-Auth-Signature": signature,
+        },
+      });
+      const body = await r.json().catch(() => null);
+      return { i: i + 1, status: r.status, ms: Math.round(performance.now() - ts),
+               servedBy: r.headers.get("X-Served-By") || "?", detail: body && body.detail };
+    }));
+    const wall = Math.round(performance.now() - t0);
+    const ok = results.filter((r) => r.status === 200).length;
+    const denied = results.length - ok;
+    const lines = [
+      `同一挑战+同一签名并发 ${n} 份，总耗时 ${wall}ms`,
+      `成功 200：${ok} 份　被拒 401：${denied} 份`,
+      "-".repeat(60),
+      ...results.map((r) => `#${String(r.i).padStart(2)} HTTP ${r.status} ${r.ms}ms 进程=${r.servedBy}` +
+        (r.detail ? `  ${esc(String(r.detail).slice(0, 60))}` : "")),
+      "-".repeat(60),
+      ok === 1 && denied === n - 1
+        ? "✅ 符合预期：挑战被原子消费，并发重放仅一次成功（跨 web1/web2 同样成立）"
+        : "❌ 不符合预期：应当恰好 1 次成功",
+    ];
+    out.textContent = lines.join("\n");
+  } catch (e) {
+    out.textContent = "异常（请先登录）：" + e.message;
+  }
+};
+
+/* ---------------- 启动 ---------------- */
+(async function init() {
+  try {
+    await ensureKey();
+    renderKey();
+  } catch (e) {
+    $("keybox").innerHTML = `<span class="pill err">密钥初始化失败</span><div class="muted">${esc(e.message)}</div>`;
+  }
+  loadMe();
+  loadStats();
+})();
 </script>
 </body>
 </html>
